@@ -22,10 +22,10 @@ def load_config(path="profiler.conf"):
     parser.read(path)
 
     CONFIG["LOG_DIR"] = parser.get("PATHS", "LOG_DIR", fallback="profiler_log")
-    CONFIG["DB_PATH"] = parser.get("PATHS", "DB_PATH", fallback="database/sqlite/database.db")
+    CONFIG["DB_PATH"] = parser.get("PATHS", "DB_PATH", fallback="database/sqlite/Miras.db")
     CONFIG["UNIMPORTABLE_DIR"] = parser.get("PATHS", "UNIMPORTABLE_DIR", fallback="database/Unimportable")
 
-    CONFIG["THREADS"] = parser.getint("GENERAL", "THREADS", fallback=12)  # меньше потоков для ARM
+    CONFIG["THREADS"] = parser.getint("GENERAL", "THREADS", fallback=12)
     CONFIG["UPDATE_INTERVAL"] = parser.getint("GENERAL", "UPDATE_INTERVAL", fallback=2)
     CONFIG["FUTURE_TIMEOUT"] = parser.getint("GENERAL", "FUTURE_TIMEOUT", fallback=60)
 
@@ -47,9 +47,12 @@ MATCH_COUNT = 0
 MATCH_LOCK = threading.Lock()
 TOTAL_ITEMS = 0
 PROGRESS_LOCK = threading.Lock()
-CURRENT_ITEM = ""
 COMPLETED = 0
+thread_ctx = threading.local()
 
+# -----------------------------
+# Баннер
+# -----------------------------
 def show_banner():
     return r"""
 /$$$$$$$  /$$$$$$$   /$$$$$$  /$$$$$$$$ /$$$$$$ /$$       /$$$$$$$$ /$$$$$$$ 
@@ -61,9 +64,10 @@ def show_banner():
 | $$      | $$  | $$|  $$$$$$/| $$       /$$$$$$| $$$$$$$$| $$$$$$$$| $$  | $$
 |__/      |__/  |__/ \______/ |__/      |______/|________/|________/|__/  |__/
 """
-print(Colorate.Horizontal(Colors.blue_to_purple, Center.XCenter(show_banner())))
 
 banner = show_banner()
+print(Colorate.Horizontal(Colors.blue_to_purple, Center.XCenter(banner)))
+
 # -----------------------------
 # Нормализация
 # -----------------------------
@@ -85,17 +89,20 @@ TRANSLIT_EN_TO_RU = str.maketrans({
     'u':'у','v':'в','w':'в','x':'кс','y':'ы','z':'з'
 })
 
-@lru_cache(maxsize=CONFIG["FAST_NORMALIZE_CACHE"])
-def fast_normalize(text: str) -> str:
-    if not isinstance(text, str):
-        text = str(text)
-    t = text.strip().lower()
-    if not t:
-        return ""
-    t = t.translate(SIMILAR_CHARS_FAST)
-    t_en = t.translate(TRANSLIT_RU_TO_EN)
-    t_ru = t.translate(TRANSLIT_EN_TO_RU)
-    return f"{t} {t_en} {t_ru}"
+if not CONFIG["USE_FAST_NORMALIZE"]:
+    fast_normalize = lambda x: x
+else:
+    @lru_cache(maxsize=CONFIG["FAST_NORMALIZE_CACHE"])
+    def fast_normalize(text: str) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+        t = text.strip().lower()
+        if not t:
+            return ""
+        t = t.translate(SIMILAR_CHARS_FAST)
+        t_en = t.translate(TRANSLIT_RU_TO_EN)
+        t_ru = t.translate(TRANSLIT_EN_TO_RU)
+        return f"{t} {t_en} {t_ru}"
 
 def bigram_set(s: str):
     s = s.strip()
@@ -113,23 +120,17 @@ def bigram_similarity(a: str, b: str) -> float:
     return inter / union if union else 0.0
 
 # -----------------------------
-# Массив поиска
+# Поиск совпадений
 # -----------------------------
 def hard_match_fast(text: str, clues_norm: list) -> bool:
     if not text:
         return False
-
-    # реально отключаем normalize
-    ntext = fast_normalize(text) if CONFIG["USE_FAST_NORMALIZE"] else text
-
-    # быстрый прямой поиск
+    text_proc = fast_normalize(text) if CONFIG["USE_FAST_NORMALIZE"] else text.lower()
     for c in clues_norm:
-        if c in ntext:
+        if c in text_proc:
             return True
-
-    # fuzzy через биграммы только если включено
     if CONFIG["USE_FUZZY"]:
-        words = re.split(r'\s+|\W+', text.lower())
+        words = re.split(r'\s+|\W+', text_proc)
         for w in words:
             if not w:
                 continue
@@ -212,7 +213,7 @@ def print_progress_dynamic(log_file, clues, start_time):
                 pass
 
             center_print(raw_bar)
-            center_print(f"SCANNING: {CURRENT_ITEM}")
+            center_print(f"SCANNING: {getattr(thread_ctx,'current','')}")
             center_print(f"{COMPLETED}/{total}  |  {percent}%")
             center_print(f"MATCHES: {MATCH_COUNT}  |  LOG SIZE: {size_mb:.2f} MB")
             center_print(f"THREADS: {CONFIG['THREADS']}")
@@ -241,51 +242,48 @@ def get_clues():
 # Скан таблиц SQLite
 # -----------------------------
 def scan_table(table, clues, clues_norm, log_file, db_path):
-    global CURRENT_ITEM
-    CURRENT_ITEM = table
+    thread_ctx.current = table
     matches_found = 0
-    conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
+        conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info('{table}');")
+        cur.execute("PRAGMA journal_mode=OFF;")
+        cur.execute("PRAGMA synchronous=OFF;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("PRAGMA cache_size=-200000;")
+        cur.execute(f"PRAGMA table_info('{table}')")
         cols_info = cur.fetchall()
         cols = [c[1] for c in cols_info] if cols_info else []
         if not cols:
             return 0
 
         for col in cols:
-            try:
-                cur.execute(f"SELECT rowid, [{col}] FROM [{table}]")
-                while True:
-                    rows = cur.fetchmany(CONFIG["BATCH_ROWS"])
-                    if not rows:
-                        break
-                    for r in rows:
-                        rowid, val = r
-                        text = "" if val is None else str(val)
-                        if hard_match_fast(text, clues_norm):
-                            log_write(f"[MATCH] TABLE:{table} | COLUMN:{col} | ROWID:{rowid} | VAL:{text}", log_file)
-                            matches_found += 1
-            except Exception as ex:
-                log_write(f"[ERROR] COLUMN LOOP {table}.{col}: {ex}", log_file)
-                continue
+            offset = 0
+            while True:
+                cur.execute(f"SELECT rowid, [{col}] FROM [{table}] LIMIT ? OFFSET ?", (CONFIG["BATCH_ROWS"], offset))
+                rows = cur.fetchall()
+                if not rows:
+                    break
+                offset += CONFIG["BATCH_ROWS"]
+                for rowid, val in rows:
+                    text = "" if val is None else str(val)
+                    if hard_match_fast(text, clues_norm):
+                        log_write(f"[MATCH] TABLE:{table} | COLUMN:{col} | ROWID:{rowid} | VAL:{text}", log_file)
+                        matches_found += 1
     except Exception as ex:
         log_write(f"[ERROR] TABLE {table} FAILED: {ex}", log_file)
     finally:
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+        try:
+            conn.close()
+        except:
+            pass
     return matches_found
 
 # -----------------------------
 # Скан файлов
 # -----------------------------
 def scan_file(path, filename, clues, clues_norm, log_file):
-    global CURRENT_ITEM
-    CURRENT_ITEM = filename
+    thread_ctx.current = filename
     matches_found = 0
     try:
         if CONFIG["CHUNKED_FILE_READ"]:
@@ -318,33 +316,32 @@ def scan_file(path, filename, clues, clues_norm, log_file):
 # -----------------------------
 def main():
     global TOTAL_ITEMS, COMPLETED
-
     print("\033c", end="")
+    for line in banner.splitlines():
+        center_print(Colorate.Horizontal(Colors.blue_to_purple, line))
     print(" ")
-for line in banner.splitlines():
-    center_print(Colorate.Horizontal(Colors.blue_to_purple, line))
-    print(" ")
+
     clues = get_clues()
-    clues_norm = [fast_normalize(c) if CONFIG["USE_FAST_NORMALIZE"] else c for c in clues]
+    clues_norm = [fast_normalize(c) if CONFIG["USE_FAST_NORMALIZE"] else c.lower() for c in clues]
     log_file = init_log(clues)
     start_time = time.time()
 
     table_count, file_count = 0, 0
-    try:
-        if os.path.exists(CONFIG["DB_PATH"]):
+    if os.path.exists(CONFIG["DB_PATH"]):
+        try:
             conn = sqlite3.connect(CONFIG["DB_PATH"])
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table';")
             table_count = cur.fetchone()[0] or 0
             conn.close()
-    except Exception:
-        table_count = 0
+        except:
+            table_count = 0
 
-    try:
-        if os.path.exists(CONFIG["UNIMPORTABLE_DIR"]):
+    if os.path.exists(CONFIG["UNIMPORTABLE_DIR"]):
+        try:
             file_count = len([f for f in os.listdir(CONFIG["UNIMPORTABLE_DIR"]) if os.path.isfile(os.path.join(CONFIG["UNIMPORTABLE_DIR"], f))])
-    except Exception:
-        file_count = 0
+        except:
+            file_count = 0
 
     TOTAL_ITEMS = max(1, table_count + file_count)
     progress_thread = threading.Thread(target=print_progress_dynamic, args=(log_file, clues, start_time), daemon=True)
@@ -358,7 +355,7 @@ for line in banner.splitlines():
             cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = [t[0] for t in cur.fetchall()]
             conn.close()
-        except Exception:
+        except:
             tables = []
 
         with ThreadPoolExecutor(max_workers=CONFIG["THREADS"]) as exe:
@@ -368,7 +365,8 @@ for line in banner.splitlines():
                     _ = future.result(timeout=CONFIG["FUTURE_TIMEOUT"])
                 except Exception as ex:
                     log_write(f"[ERROR] table task failed/timeout: {ex}", log_file)
-                COMPLETED += 1
+                with PROGRESS_LOCK:
+                    COMPLETED += 1
 
     # файлы
     if file_count > 0:
@@ -380,7 +378,8 @@ for line in banner.splitlines():
                     _ = future.result(timeout=CONFIG["FUTURE_TIMEOUT"])
                 except Exception as ex:
                     log_write(f"[ERROR] file task failed/timeout: {ex}", log_file)
-                COMPLETED += 1
+                with PROGRESS_LOCK:
+                    COMPLETED += 1
 
     progress_thread.join()
     center_print(Colorate.Horizontal(Colors.green_to_cyan, f"\n=== DONE ===\nLOG SAVED: {os.path.abspath(log_file)}"))
