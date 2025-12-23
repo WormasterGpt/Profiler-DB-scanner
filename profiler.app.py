@@ -1,3 +1,5 @@
+
+import queue
 import os
 import re
 import sqlite3
@@ -44,12 +46,20 @@ load_config()
 # Глобальные счётчики
 # -----------------------------
 MATCH_COUNT = 0
-MATCH_LOCK = threading.Lock()
 TOTAL_ITEMS = 0
 PROGRESS_LOCK = threading.Lock()
 COMPLETED = 0
-thread_ctx = threading.local()
+CURRENT_ITEM = ""
+CURRENT_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+#STOP_EVENT = threading.Event()
 
+LOG_DATA = {
+    "start_time": None,
+    "end_time": None,
+    "clues": [],
+    "sources": {}
+}
 # -----------------------------
 # Баннер
 # -----------------------------
@@ -119,6 +129,21 @@ def bigram_similarity(a: str, b: str) -> float:
     union = len(A | B)
     return inter / union if union else 0.0
 
+# Очередь логов
+log_queue = queue.Queue()
+
+def log_writer_thread(log_file):
+    while True:
+        item = log_queue.get()
+        if item is None:  # сигнал завершения логирования
+            break
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(item + "\n")
+        log_queue.task_done()
+
+def log_write(message):
+    log_queue.put(message)
+
 # -----------------------------
 # Поиск совпадений
 # -----------------------------
@@ -162,24 +187,48 @@ def center_print(text):
     print(" " * pad + text)
 
 def init_log(clues):
-    safe_clues = "_".join([c.replace(" ", "_") for c in clues]) or "no_clues"
-    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"log_profiler_{date_str}_{safe_clues}.log"
-    path = os.path.join(CONFIG["LOG_DIR"], filename)
-    open(path, "w", encoding="utf-8").close()
-    return path
+    if not os.path.exists(CONFIG["LOG_DIR"]):
+        os.makedirs(CONFIG["LOG_DIR"])
 
-def log_write(msg, log_file):
+    safe_clues = ",".join(clues)
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = os.path.join(CONFIG["LOG_DIR"], f"log_profiler_{date_str}.log")
+
+    LOG_DATA["start_time"] = datetime.now()
+    LOG_DATA["clues"] = clues
+
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write(f"┌[{safe_clues}]\n")
+        f.write("│\n")
+        f.write(f"├START: {LOG_DATA['start_time'].strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("├────────────────────────────\n")
+
+    return log_file
+
+def log_match_live(source: str, row_info: dict):
     global MATCH_COUNT
-    try:
-        if msg.startswith("[MATCH]"):
-            with MATCH_LOCK:
-                MATCH_COUNT += 1
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-            f.flush()
-    except Exception:
-        pass
+    lines = []
+
+    header_needed = False
+    with LOG_LOCK:
+        if source not in LOG_DATA["sources"]:
+            LOG_DATA["sources"][source] = True
+            header_needed = True
+
+    if header_needed:
+        lines.extend(["│", "│", "├─┐", f"│{source}"])
+
+    lines.append(f"│ ├─{row_info['rowid']}")
+    for col, val in row_info.items():
+        if col != "rowid":
+            lines.append(f"│ │ ├─{col}: {val}")
+
+    with LOG_LOCK:
+        MATCH_COUNT += 1
+
+    # Кладём все строки в очередь
+    for line in lines:
+        log_queue.put(line)
 
 # -----------------------------
 # Прогресс
@@ -213,7 +262,9 @@ def print_progress_dynamic(log_file, clues, start_time):
                 pass
 
             center_print(raw_bar)
-            center_print(f"SCANNING: {getattr(thread_ctx,'current','')}")
+            with CURRENT_LOCK:
+              current = CURRENT_ITEM
+            center_print(f"SCANNING: {current}")
             center_print(f"{COMPLETED}/{total}  |  {percent}%")
             center_print(f"MATCHES: {MATCH_COUNT}  |  LOG SIZE: {size_mb:.2f} MB")
             center_print(f"THREADS: {CONFIG['THREADS']}")
@@ -242,7 +293,10 @@ def get_clues():
 # Скан таблиц SQLite
 # -----------------------------
 def scan_table(table, clues, clues_norm, log_file, db_path):
-    thread_ctx.current = table
+    global CURRENT_ITEM, MATCH_COUNT
+    with CURRENT_LOCK:
+        CURRENT_ITEM = f"TABLE: {table}"
+    
     matches_found = 0
     try:
         conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
@@ -251,40 +305,53 @@ def scan_table(table, clues, clues_norm, log_file, db_path):
         cur.execute("PRAGMA synchronous=OFF;")
         cur.execute("PRAGMA temp_store=MEMORY;")
         cur.execute("PRAGMA cache_size=-200000;")
+        
         cur.execute(f"PRAGMA table_info('{table}')")
         cols_info = cur.fetchall()
         cols = [c[1] for c in cols_info] if cols_info else []
         if not cols:
             return 0
 
-        for col in cols:
-            offset = 0
-            while True:
-                cur.execute(f"SELECT rowid, [{col}] FROM [{table}] LIMIT ? OFFSET ?", (CONFIG["BATCH_ROWS"], offset))
-                rows = cur.fetchall()
-                if not rows:
-                    break
-                offset += CONFIG["BATCH_ROWS"]
-                for rowid, val in rows:
+        offset = 0
+        batch_size = CONFIG["BATCH_ROWS"]
+        while True:
+            col_str = ", ".join(f"[{c}]" for c in cols)
+            cur.execute(f"SELECT rowid, {col_str} FROM [{table}] LIMIT ? OFFSET ?", (batch_size, offset))
+            rows = cur.fetchall()
+            if not rows:
+                break
+            offset += batch_size
+
+            for row in rows:
+                rowid = row[0]
+                row_dict = {cols[i]: row[i+1] for i in range(len(cols))}
+                for col, val in row_dict.items():
                     text = "" if val is None else str(val)
                     if hard_match_fast(text, clues_norm):
-                        log_write(f"[MATCH] TABLE:{table} | COLUMN:{col} | ROWID:{rowid} | VAL:{text}", log_file)
+                        log_match_live(source=f"TABLE:{table}", row_info={"rowid": rowid, **{col: text}})
                         matches_found += 1
+
     except Exception as ex:
-        log_write(f"[ERROR] TABLE {table} FAILED: {ex}", log_file)
+        log_write(f"[ERROR] TABLE {table} FAILED: {ex}")
     finally:
         try:
             conn.close()
         except:
             pass
+
     return matches_found
+
 
 # -----------------------------
 # Скан файлов
 # -----------------------------
 def scan_file(path, filename, clues, clues_norm, log_file):
-    thread_ctx.current = filename
+    global CURRENT_ITEM, MATCH_COUNT
+    with CURRENT_LOCK:
+        CURRENT_ITEM = f"FILE: {filename}"
+
     matches_found = 0
+    rowid = 0  # глобальный счетчик строк
     try:
         if CONFIG["CHUNKED_FILE_READ"]:
             with open(path, "rb") as fh:
@@ -296,26 +363,63 @@ def scan_file(path, filename, clues, clues_norm, log_file):
                     buffer += chunk
                     lines = buffer.split(b"\n")
                     buffer = lines.pop() if lines else b""
-                    for idx, line in enumerate(lines, 1):
+                    for line in lines:
+                        rowid += 1
                         text = line.decode("utf-8", errors="ignore")
                         if hard_match_fast(text, clues_norm):
-                            log_write(f"[MATCH] FILE:{filename} | LINE:{idx} | {text.strip()}", log_file)
+                            log_match_live(
+                                source=f"FILE:{filename}",
+                                row_info={"rowid": rowid, "line": text.strip()}
+                            )
                             matches_found += 1
+            # Проверка последнего остатка буфера
+            if buffer:
+                rowid += 1
+                text = buffer.decode("utf-8", errors="ignore")
+                if hard_match_fast(text, clues_norm):
+                    log_match_live(
+                        source=f"FILE:{filename}",
+                        row_info={"rowid": rowid, "line": text.strip()}
+                    )
+                    matches_found += 1
         else:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for lineno, line in enumerate(f, 1):
+                for line in f:
+                    rowid += 1
                     if hard_match_fast(line, clues_norm):
-                        log_write(f"[MATCH] FILE:{filename} | LINE:{lineno} | {line.strip()}", log_file)
+                        log_match_live(
+                            source=f"FILE:{filename}",
+                            row_info={"rowid": rowid, "line": line.strip()}
+                        )
                         matches_found += 1
     except Exception as ex:
-        log_write(f"[ERROR] Could not read {filename}: {ex}", log_file)
+        log_write(f"[ERROR] Could not read {filename}: {ex}")
+
     return matches_found
+
+# -----------------------------
+# Финальная запись лога
+# -----------------------------
+def write_final_stats(log_file):
+    LOG_DATA["end_time"] = datetime.now()
+    duration = (LOG_DATA["end_time"] - LOG_DATA["start_time"]).total_seconds()
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write("│\n│\n")
+        f.write(f"├Matches: {MATCH_COUNT}\n")
+        f.write(f"├Tables and files ith matches: {len(LOG_DATA['sources'])}\n")
+        f.write("├Source of data:\n")
+        for src in LOG_DATA["sources"]:
+            f.write(f"│  {src}\n")
+        f.write(f"├Scan time: {duration:.2f} сек\n")
+        f.write("└End of log.\n")
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
     global TOTAL_ITEMS, COMPLETED
+
     print("\033c", end="")
     for line in banner.splitlines():
         center_print(Colorate.Horizontal(Colors.blue_to_purple, line))
@@ -324,8 +428,14 @@ def main():
     clues = get_clues()
     clues_norm = [fast_normalize(c) if CONFIG["USE_FAST_NORMALIZE"] else c.lower() for c in clues]
     log_file = init_log(clues)
+    log_file = init_log(clues)
+
+    # Запуск потока-логгера
+    log_thread = threading.Thread(target=log_writer_thread, args=(log_file,), daemon=True)
+    log_thread.start()
     start_time = time.time()
 
+    # Определяем количество таблиц и файлов
     table_count, file_count = 0, 0
     if os.path.exists(CONFIG["DB_PATH"]):
         try:
@@ -344,10 +454,14 @@ def main():
             file_count = 0
 
     TOTAL_ITEMS = max(1, table_count + file_count)
+
+    # Запуск потока прогресса
     progress_thread = threading.Thread(target=print_progress_dynamic, args=(log_file, clues, start_time), daemon=True)
     progress_thread.start()
 
-    # таблицы
+    # -----------------------------
+    # Скан таблиц
+    # -----------------------------
     if table_count > 0:
         try:
             conn = sqlite3.connect(CONFIG["DB_PATH"])
@@ -364,11 +478,13 @@ def main():
                 try:
                     _ = future.result(timeout=CONFIG["FUTURE_TIMEOUT"])
                 except Exception as ex:
-                    log_write(f"[ERROR] table task failed/timeout: {ex}", log_file)
+                    log_write(f"[ERROR] table task failed/timeout: {ex}")
                 with PROGRESS_LOCK:
                     COMPLETED += 1
 
-    # файлы
+    # -----------------------------
+    # Скан файлов
+    # -----------------------------
     if file_count > 0:
         files = [f for f in os.listdir(CONFIG["UNIMPORTABLE_DIR"]) if os.path.isfile(os.path.join(CONFIG["UNIMPORTABLE_DIR"], f))]
         with ThreadPoolExecutor(max_workers=CONFIG["THREADS"]) as exe:
@@ -377,13 +493,25 @@ def main():
                 try:
                     _ = future.result(timeout=CONFIG["FUTURE_TIMEOUT"])
                 except Exception as ex:
-                    log_write(f"[ERROR] file task failed/timeout: {ex}", log_file)
+                    log_write(f"[ERROR] file task failed/timeout: {ex}")
                 with PROGRESS_LOCK:
                     COMPLETED += 1
 
+    # Ждём завершения прогресса
     progress_thread.join()
-    center_print(Colorate.Horizontal(Colors.green_to_cyan, f"\n=== DONE ===\nLOG SAVED: {os.path.abspath(log_file)}"))
 
+    # Финальная запись лога
+    write_final_stats(log_file)
+    log_queue.put(None)  # сигнал завершения логгера
+    log_thread.join()    # ждём пока поток закончит
+    # Вывод DONE
+    center_print(Colorate.Horizontal(
+        Colors.green_to_cyan,
+        f"\n=== DONE ===\n"
+        f"LOG SAVED: {os.path.abspath(log_file)}\n"
+        f"MATCHES: {MATCH_COUNT}"
+    ))
+    
 if __name__ == "__main__":
     try:
         main()

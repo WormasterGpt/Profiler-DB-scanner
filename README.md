@@ -13,3 +13,11 @@ How it works?
 4.After scanning you can read the log file.
 
 You can configure the script by editing the profiler.conf
+
+Requirements:
+pystyle
+Python 3.12 or newer
+
+How to launch?
+
+python3 Profiler.app.py
