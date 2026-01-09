@@ -15,8 +15,7 @@ How it works?
 You can configure the script by editing the profiler.conf
 
 Requirements:
-pystyle
-Python 3.12 or newer
+Python 3.12 or newer, other in requirements file
 
 How to launch?
 
